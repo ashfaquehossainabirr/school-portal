@@ -5,6 +5,22 @@ const { protect, authorize } = require('../middleware/auth');
 
 const router = express.Router();
 
+// Resolves the current main admin's id. Self-healing: if no admin is
+// flagged yet (e.g. an install from before this feature existed), the
+// earliest-created admin is promoted and the flag persisted, so protection
+// applies automatically without a manual migration step.
+async function getMainAdminId() {
+  let mainAdmin = await User.findOne({ role: 'admin', isMainAdmin: true });
+  if (!mainAdmin) {
+    mainAdmin = await User.findOne({ role: 'admin' }).sort({ createdAt: 1 });
+    if (mainAdmin) {
+      mainAdmin.isMainAdmin = true;
+      await mainAdmin.save();
+    }
+  }
+  return mainAdmin?._id?.toString();
+}
+
 // GET all users (admin) - optional filters: ?role=student&className=Class 8&section=A
 router.get('/', protect, authorize('admin', 'teacher'), async (req, res) => {
   try {
@@ -40,6 +56,15 @@ router.put('/:id', protect, authorize('admin'), async (req, res) => {
   try {
     const updates = { ...req.body };
     delete updates.password; // password changes go through change-password route
+    delete updates.isMainAdmin; // never settable through the general update endpoint
+
+    if (updates.role) {
+      const mainAdminId = await getMainAdminId();
+      if (mainAdminId && req.params.id === mainAdminId && updates.role !== 'admin') {
+        return res.status(403).json({ message: 'The main admin account cannot have its role changed' });
+      }
+    }
+
     const user = await User.findByIdAndUpdate(req.params.id, updates, {
       new: true,
       runValidators: true,
@@ -56,6 +81,11 @@ router.delete('/:id', protect, authorize('admin'), async (req, res) => {
   try {
     if (req.params.id === req.user._id.toString()) {
       return res.status(400).json({ message: 'You cannot delete your own account' });
+    }
+
+    const mainAdminId = await getMainAdminId();
+    if (mainAdminId && req.params.id === mainAdminId) {
+      return res.status(403).json({ message: 'The main admin account cannot be deleted' });
     }
 
     const user = await User.findById(req.params.id);
@@ -126,10 +156,46 @@ router.put('/:id/reset-password', protect, authorize('admin'), async (req, res) 
   }
 });
 
+// PUT transfer the Main Admin title to another admin account. Restricted to
+// the current main admin only — otherwise any admin could just crown
+// themselves and the whole protection would mean nothing.
+router.put('/:id/make-main-admin', protect, authorize('admin'), async (req, res) => {
+  try {
+    if (!req.user.isMainAdmin) {
+      return res.status(403).json({ message: 'Only the current main admin can transfer this role' });
+    }
+
+    const target = await User.findById(req.params.id);
+    if (!target || target.role !== 'admin') {
+      return res.status(400).json({ message: 'Target must be an existing admin account' });
+    }
+    if (target._id.toString() === req.user._id.toString()) {
+      return res.status(400).json({ message: 'This account is already the main admin' });
+    }
+
+    await User.updateOne({ _id: req.user._id }, { isMainAdmin: false });
+    target.isMainAdmin = true;
+    await target.save();
+
+    const { password: _pw, ...safe } = target.toObject();
+    res.json({ message: `${target.name} is now the main admin`, user: safe });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 // PATCH activate or deactivate a user account (admin only)
 router.patch('/:id/status', protect, authorize('admin'), async (req, res) => {
   try {
     const { isActive } = req.body;
+
+    if (!isActive) {
+      const mainAdminId = await getMainAdminId();
+      if (mainAdminId && req.params.id === mainAdminId) {
+        return res.status(403).json({ message: 'The main admin account cannot be deactivated' });
+      }
+    }
+
     const user = await User.findByIdAndUpdate(
       req.params.id,
       { isActive: !!isActive },
